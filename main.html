@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mini Platformer</title>
+  <style>
+    :root{
+      --bg:#0f1724;
+      --fg:#e6eef8;
+      --accent:#7c3aed;
+      --plat:#1f2937;
+      --player:#f59e0b;
+    }
+    html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;}
+    body{
+      background: linear-gradient(180deg,var(--bg) 0%, #0b1220 100%);
+      color:var(--fg);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:18px;
+    }
+
+    /* Game container centers canvas and gives a subtle glow */
+    .game-wrap{
+      width:900px;
+      max-width:100%;
+      border-radius:12px;
+      box-shadow: 0 8px 30px rgba(2,6,23,0.6), 0 0 30px rgba(124,58,237,0.05);
+      background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+      padding:12px;
+    }
+
+    canvas{
+      display:block;
+      width:100%;
+      height:600px;
+      background:
+        radial-gradient(1200px 400px at 20% 10%, rgba(124,58,237,0.06), transparent 10%),
+        linear-gradient(180deg, rgba(255,255,255,0.018), transparent 40%);
+      border-radius:8px;
+      box-shadow: inset 0 -30px 60px rgba(0,0,0,0.25);
+    }
+
+    .hud{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:12px;
+      padding:8px 6px;
+      color:var(--fg);
+      font-size:14px;
+    }
+
+    .btn{
+      background:linear-gradient(180deg,#1f2937,#111827);
+      padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);
+      cursor:pointer;color:var(--fg);font-weight:600;
+    }
+
+    .controls {opacity:0.9;font-size:13px}
+    .tip{color:rgba(230,238,248,0.7);font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="game-wrap">
+    <div class="hud">
+      <div class="tip">Use ← → to move, ↑ / Space to jump — collect stars!</div>
+      <div>
+        <button id="restart" class="btn">Restart</button>
+      </div>
+    </div>
+    <canvas id="game"></canvas>
+  </div>
+
+<script>
+/* === Simple Platformer ===
+   Features:
+   - canvas rendering
+   - keyboard controls (left/right/jump)
+   - gravity + collision with platforms (AABB)
+   - collectible stars + score
+   - camera follow (horizontal + vertical)
+*/
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // logical resolution (keeps gameplay consistent)
+  const W = 900, H = 600;
+  canvas.width = W;
+  canvas.height = H;
+
+  // world (bigger than screen)
+  const worldWidth = 2200;
+  const worldHeight = 1200;
+
+  // player
+  const player = {
+    x:100, y:400, w:36, h:48,
+    vx:0, vy:0,
+    speed: 5.2,
+    jumpPower: 12.5,
+    onGround:false,
+    color: null
+  };
+
+  player.color = getComputedStyle(document.documentElement).getPropertyValue('--player') || '#f59e0b';
+
+  // physics
+  const gravity = 0.7;
+  const friction = 0.86;
+  const airFriction = 0.995;
+  const maxFall = 24;
+
+  // camera
+  const cam = {x:0,y:0,w:W,h:H};
+
+  // input
+  const keys = { left:false, right:false, up:false };
+
+  window.addEventListener('keydown', e => {
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') keys.left = true;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.right = true;
+    if (e.code === 'ArrowUp' || e.code === 'Space' || e.code === 'KeyW') {
+      keys.up = true;
+      // allow jump only on keydown
+      if (player.onGround) {
+        player.vy = -player.jumpPower;
+        player.onGround = false;
+      }
+    }
+  });
+  window.addEventListener('keyup', e => {
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') keys.left = false;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.right = false;
+    if (e.code === 'ArrowUp' || e.code === 'Space' || e.code === 'KeyW') keys.up = false;
+  });
+
+  // platforms (x,y,w,h) - ground + some floating platforms
+  const platforms = [
+    {x:0, y:520, w:1600, h:80},
+    {x:1700, y:520, w:500, h:80},
+    {x:300, y:420, w:220, h:18},
+    {x:650, y:360, w:160, h:18},
+    {x:980, y:300, w:220, h:18},
+    {x:1320, y:260, w:160, h:18},
+    {x:1600, y:180, w:200, h:18},
+    {x:450, y:540, w:1400, h:18}, // extra wide slope-ish
+    {x:2000, y:420, w:180, h:18},
+  ];
+
+  // stars (collectibles)
+  const stars = [];
+  function initStars(){
+    stars.length = 0;
+    const positions = [
+      {x:380,y:380},{x:710,y:320},{x:1040,y:260},
+      {x:1370,y:220},{x:1650,y:140},{x:220,y:480},
+      {x:1800,y:360},{x:2050,y:380}
+    ];
+    positions.forEach(p=>{
+      stars.push({x:p.x, y:p.y, r:10, collected:false});
+    });
+  }
+
+  // score
+  let score = 0;
+
+  // restart / reset
+  function reset(){
+    player.x = 100; player.y = 400; player.vx = 0; player.vy = 0;
+    cam.x = 0; cam.y = 0;
+    score = 0;
+    initStars();
+  }
+
+  document.getElementById('restart').addEventListener('click', reset);
+
+  // basic AABB collision test
+  function aabb(ax,ay,aw,ah,bx,by,bw,bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // main update
+  function update() {
+    // horizontal input
+    if (keys.left) player.vx -= player.speed * 0.18;
+    if (keys.right) player.vx += player.speed * 0.18;
+
+    // clamp speed
+    player.vx = Math.max(-player.speed*1.8, Math.min(player.vx, player.speed*1.8));
+
+    // apply friction
+    if (player.onGround) player.vx *= friction;
+    else player.vx *= airFriction;
+
+    // gravity
+    player.vy += gravity;
+    if (player.vy > maxFall) player.vy = maxFall;
+
+    // move
+    player.x += player.vx;
+    player.y += player.vy;
+
+    // world bounds
+    if (player.x < 0) { player.x = 0; player.vx = 0; }
+    if (player.x + player.w > worldWidth) { player.x = worldWidth - player.w; player.vx = 0; }
+    if (player.y + player.h > worldHeight) {
+      player.y = worldHeight - player.h;
+      player.vy = 0;
+      player.onGround = true;
+    }
+
+    // platform collisions (simple: correct vertical then horizontal)
+    player.onGround = false;
+    for (let p of platforms){
+      // only check if overlapping in x
+      if (player.x + player.w > p.x && player.x < p.x + p.w) {
+        // falling onto platform
+        if (player.vy >= 0 && player.y + player.h <= p.y + player.vy + 2) {
+          if (player.y + player.h > p.y - 50 && player.y + player.h <= p.y + p.h) {
+            player.y = p.y - player.h;
+            player.vy = 0;
+            player.onGround = true;
+          }
+        }
+      }
+      // simple horizontal collision correction (so player doesn't clip through thin platforms sides)
+      if (aabb(player.x, player.y, player.w, player.h, p.x, p.y, p.w, p.h)) {
+        // resolve smallest overlap
+        const overlapX = Math.min(player.x + player.w - p.x, p.x + p.w - player.x);
+        const overlapY = Math.min(player.y + player.h - p.y, p.y + p.h - player.y);
+        if (overlapX < overlapY) {
+          // push horizontally
+          if (player.x < p.x) player.x -= overlapX;
+          else player.x += overlapX;
+          player.vx = 0;
+        } else {
+          // push vertically
+          if (player.y < p.y) {
+            player.y -= overlapY;
+            player.vy = 0;
+            player.onGround = true;
+          } else {
+            player.y += overlapY;
+            player.vy = 0;
+          }
+        }
+      }
+    }
+
+    // collect stars
+    for (let s of stars){
+      if (!s.collected){
+        if (aabb(player.x, player.y, player.w, player.h, s.x - s.r, s.y - s.r, s.r*2, s.r*2)) {
+          s.collected = true;
+          score += 1;
+        }
+      }
+    }
+
+    // camera follow (center player but clamped to world)
+    const targetX = player.x + player.w/2 - cam.w/2;
+    const targetY = player.y + player.h/2 - cam.h/2;
+    // smooth follow
+    cam.x += (targetX - cam.x) * 0.12;
+    cam.y += (targetY - cam.y) * 0.12;
+    // clamp
+    cam.x = Math.max(0, Math.min(worldWidth - cam.w, cam.x));
+    cam.y = Math.max(0, Math.min(worldHeight - cam.h, cam.y));
+  }
+
+  function draw() {
+    // clear
+    ctx.clearRect(0,0,W,H);
+
+    // background sky gradient (world-level)
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, 'rgba(12,18,34,1)');
+    g.addColorStop(1, 'rgba(8,12,20,1)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    // decorative parallax stars / hills
+    // distant fog
+    ctx.fillStyle = 'rgba(255,255,255,0.02)';
+    for (let i=0;i<80;i++){
+      const sx = (i*123 + cam.x*0.15) % (worldWidth) - cam.x*0.15;
+      const sy = 40 + ((i*37) % 120) + Math.sin((i+cam.x)/60)*10;
+      ctx.fillRect(sx - cam.x*0.02, sy - cam.y*0.02, 6, 2);
+    }
+
+    // draw platforms
+    for (let p of platforms){
+      const rx = p.x - cam.x, ry = p.y - cam.y;
+      // platform shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(rx+6, ry+10, p.w, p.h);
+      // main
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--plat') || '#1f2937';
+      roundRect(ctx, rx, ry, p.w, p.h, 6, true, false);
+      // top highlight
+      ctx.fillStyle = 'rgba(255,255,255,0.03)';
+      roundRect(ctx, rx, ry, p.w, Math.max(4,p.h/3), 6, true, false);
+    }
+
+    // draw stars
+    for (let s of stars){
+      if (s.collected) continue;
+      const sx = s.x - cam.x, sy = s.y - cam.y;
+      drawStar(ctx, sx, sy, s.r, s.r*0.5);
+      // small glow
+      ctx.fillStyle = 'rgba(255,230,120,0.06)';
+      ctx.beginPath();
+      ctx.arc(sx, sy, s.r*2.4, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // draw player
+    const px = player.x - cam.x, py = player.y - cam.y;
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(px+6, py+player.h-6, player.w, 6);
+    // body rectangle with slight rounding
+    ctx.fillStyle = player.color;
+    roundRect(ctx, px, py, player.w, player.h, 8, true, false);
+
+    // simple face/eye
+    ctx.fillStyle = '#111';
+    ctx.fillRect(px + 8, py + 12, 6, 6);
+    ctx.fillRect(px + 22, py + 12, 6, 6);
+
+    // HUD - score
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '16px Inter, system-ui, Arial';
+    ctx.fillText('Stars: ' + score + ' / ' + stars.length, 16, 26);
+    // instructions on screen bottom-left
+    ctx.fillStyle = 'rgba(230,238,248,0.48)';
+    ctx.font = '12px Inter, system-ui, Arial';
+    ctx.fillText('← → to move  •  ↑ / Space to jump  •  Collect all stars', 16, H - 12);
+
+    // win message
+    if (score === stars.length) {
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(W/2 - 200, H/2 - 70, 400, 120);
+      ctx.fillStyle = 'white';
+      ctx.font = '28px Inter, system-ui, Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('You collected all stars!', W/2, H/2 - 8);
+      ctx.font = '16px Inter, system-ui, Arial';
+      ctx.fillText('Press Restart to play again', W/2, H/2 + 26);
+      ctx.textAlign = 'start';
+    }
+  }
+
+  // helpers
+  function roundRect(ctx, x, y, w, h, r, fill, stroke){
+    if (typeof r === 'undefined') r = 5;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    if (fill) ctx.fill();
+    if (stroke) ctx.stroke();
+  }
+
+  function drawStar(ctx, cx, cy, r, inner){
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.beginPath();
+    for (let i=0;i<10;i++){
+      const rad = (i%2===0)? r : inner;
+      const a = Math.PI/5 * i - Math.PI/2;
+      ctx.lineTo(Math.cos(a)*rad, Math.sin(a)*rad);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'gold';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // game loop
+  function loop(){
+    update();
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // initialize
+  reset();
+  loop();
+
+  // responsive canvas sizing to keep crisp pixel ratio
+  function fitCanvas(){
+    const ratio = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.floor(rect.width * ratio);
+    canvas.height = Math.floor(rect.height * ratio);
+    // keep logical drawing scaled
+    ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+  }
+
+  // fit once and on resize
+  function debounce(fn, wait=120){
+    let t;
+    return (...a)=>{ clearTimeout(t); t = setTimeout(()=>fn(...a), wait); };
+  }
+  window.addEventListener('resize', debounce(()=> {
+    // keep CSS size but maintain logical resolution; we update transform
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
+    // maintain internal transform for crisp scaling
+    fitCanvas();
+  }, 100));
+  // initial transform
+  fitCanvas();
+
+})(); // IIFE end
+</script>
+</body>
+</html>
